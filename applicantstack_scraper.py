@@ -4,12 +4,12 @@ import json
 import time
 import os
 import re
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =================== CONFIG ===================
-# NOTE: ممكن تتغطى من Secrets في GitHub Actions (هنعمل override تحت)
+# NOTE: ممكن تتغطى من Secrets في GitHub Actions (override تحت)
 API_TOKEN =  "sonuwlfuefnrt5be8ti99puw5qc7yt7qe0dqg7gs"
 API_PUBLISHER = "TheProf"
 
@@ -26,13 +26,18 @@ HEADERS = {
 DEFAULT_PAGE_SIZE = 100
 API_CALL_DELAY = 1
 MAX_RETRIES = 3
-MAX_WORKERS = 1
+# ⭐ يمكن تغييره عبر متغير بيئة، الافتراضي 8 لتسريع الفetch للتفاصيل
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
-# ====== NEW: State/Run settings ======
+# ====== State / Run settings ======
 STATE_FILE = "applicantstack_state.json"
 OUTPUT_DIR = "exports"
-PAGES_PER_RUN = 10                 # كل Run هنجمع كام صفحة
-TARGET_LAST_PAGE = 5000            # ✅ هنوقف عند الصفحة 5000 (أو آخر صفحة متاحة، أيهما أصغر)
+
+# ✅ هنوقف عند الصفحة 5000 كحد أقصى (أو عند آخر صفحة متاحة إن كانت أقل)
+TARGET_LAST_PAGE = 5000
+
+# ✅ عدد السجلات المطلوب جمعها في كل Run
+RECORDS_PER_RUN = 5000
 # =====================================
 
 # ==== Allow env override from CI Secrets ====
@@ -83,6 +88,7 @@ def fetch_page_candidates(page_number: int) -> Union[List[Dict[str, Any]], None]
         if isinstance(candidates_data, list):
             candidate_list = candidates_data
         elif isinstance(candidates_data, dict):
+            # التكيّف مع تنسيقات مختلفة من الAPI
             for value in candidates_data.values():
                 if isinstance(value, list) and len(value) > len(candidate_list):
                     candidate_list = value
@@ -172,43 +178,56 @@ def get_total_pages() -> int:
         print("Failed to decode JSON response from base API. Assuming 1 page.")
         return 1
 
-def get_candidates_data_in_range(start_page: int, end_page: int) -> List[Dict[str, Any]]:
-    all_candidates_details = []
-    if start_page > end_page:
-        start_page, end_page = end_page, start_page
+def collect_candidates_until(target_records: int, start_page: int, max_page: int) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    يلفّ على الصفحات من start_page حتى max_page ويجمع تفاصيل المرشحين
+    لحدّ ما يوصل target_records أو تخلص الصفحات.
+    يرجّع (البيانات, آخر صفحة تم الوصول لها).
+    """
+    all_details: List[Dict[str, Any]] = []
+    last_page = start_page - 1
+    page = start_page
 
-    print(f"\n🚀 Starting data fetch for pages {start_page} to {end_page}...")
+    while len(all_details) < target_records and page <= max_page:
+        print(f"Processing page {page}...")
+        page_candidates = fetch_page_candidates(page)
+        last_page = page
+        page += 1
 
-    for page_num in range(start_page, end_page + 1):
-        print(f"Processing page {page_num}...")
-        page_candidates = fetch_page_candidates(page_num)
         if not page_candidates:
-            print(f"  -> No candidates found on page {page_num} or fetch failed. Skipping to next page.")
+            print("  -> No candidates or fetch failed for this page. Continue.")
             continue
 
-        candidate_ids = []
-        for candidate_summary in page_candidates:
+        candidate_ids: List[str] = []
+        for summary in page_candidates:
             candidate_id = None
-            if isinstance(candidate_summary, dict):
-                candidate_id = candidate_summary.get("Candidate Serial") or candidate_summary.get("id") or candidate_summary.get("candidate_id")
+            if isinstance(summary, dict):
+                candidate_id = summary.get("Candidate Serial") or summary.get("id") or summary.get("candidate_id")
             if isinstance(candidate_id, (str, int)) and str(candidate_id).strip():
                 candidate_ids.append(str(candidate_id))
             else:
-                all_candidates_details.append({"summary_error": "Valid ID not found in summary", **candidate_summary})
+                # لو مفيش ID صالح، خليه يدخل كصف “مشروح” برضه
+                all_details.append({"summary_error": "Valid ID not found in summary", **summary})
 
-        print(f"  -> Fetching details for {len(candidate_ids)} candidates concurrently...")
+        print(f"  -> Fetching details for {len(candidate_ids)} candidates concurrently (workers={MAX_WORKERS})...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_id = {executor.submit(fetch_candidate_detail, cid): cid for cid in candidate_ids}
             for future in as_completed(future_to_id):
                 try:
                     detail = future.result()
-                    all_candidates_details.append(detail)
+                    all_details.append(detail)
+                    if len(all_details) >= target_records:
+                        break
                 except Exception as exc:
                     cid = future_to_id[future]
                     print(f"  -> Detail fetch for Candidate {cid} generated an exception: {exc}")
 
-    print(f"\n✅ Finished chunk fetch. Total records collected in this run: {len(all_candidates_details)}")
-    return all_candidates_details
+    # لو زاد عدد العناصر عن المطلوب (بسبب آخر صفحة)، قصّه لـ target_records بالظبط
+    if len(all_details) > target_records:
+        all_details = all_details[:target_records]
+
+    print(f"\n✅ Collected {len(all_details)} records in this run.")
+    return all_details, last_page
 
 # ============ STATE HELPERS ============
 def load_state():
@@ -218,7 +237,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    # مابقيناش نحتاج total_saved (هنوقف بالصفحة مش بعدّ السجلات)
+    # مش بنعدّ سجلات تراكمية دلوقتي؛ التركيز على تقدّم الصفحات
     return {"current_page": 1, "total_pages": None, "completed": False}
 
 def save_state(state: dict):
@@ -258,7 +277,7 @@ def main():
 
     state = load_state()
     if state.get("completed"):
-        print("✅ Target page reached earlier. Nothing to do.")
+        print("✅ Target last page reached earlier. Nothing to do.")
         return
 
     # اجمع إجمالي الصفحات أول مرة فقط
@@ -279,18 +298,21 @@ def main():
         save_state(state)
         return
 
-    # حدد رينج الصفحات لRun واحدة
-    start_page = current_page
-    end_page = min(current_page + PAGES_PER_RUN - 1, max_page)
+    print(f"Collecting up to {RECORDS_PER_RUN} records in this run (pages {current_page}..{max_page})")
 
-    print(f"Fetching pages {start_page}..{end_page} (max_page={max_page})")
-    batch = get_candidates_data_in_range(start_page, end_page)
+    # ⭐ اجمع لحد 5000 سجل أو نهاية الصفحات
+    batch, last_page = collect_candidates_until(
+        target_records=RECORDS_PER_RUN,
+        start_page=current_page,
+        max_page=max_page
+    )
 
     # ملف Excel جديد للداتا الحالية فقط
     _ = save_run_to_new_excel(batch)
 
-    # حدّث الحالة (نتقدم بالصفحات فقط)
-    state["current_page"] = end_page + 1
+    # حدّث الحالة: نتقدم بالصفحات فقط
+    next_page = (last_page + 1) if last_page >= current_page else current_page
+    state["current_page"] = next_page
     if state["current_page"] > max_page:
         state["completed"] = True
         print(f"✅ Target last page reached: {max_page}.")
