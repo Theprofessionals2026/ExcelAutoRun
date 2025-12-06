@@ -1,12 +1,13 @@
-name: ApplicantStack every 15m
+name: ApplicantStack every 30m
 on:
   schedule:
-    - cron: "*/15 * * * *"   # UTC
+    - cron: "*/30 * * * *"   # UTC: كل 30 دقيقة
   workflow_dispatch: {}
 
 permissions:
   contents: write   # لازم علشان نقدر نعمل push
 
+# يمنع تداخل الرنز: الجديدة هتستنى لحد ما الحالية تخلص
 concurrency:
   group: applicantstack-cron
   cancel-in-progress: false
@@ -14,6 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +45,7 @@ jobs:
       # - name: Reset state (one-off)
       #   run: rm -f applicantstack_state.json
 
-      - name: Run scraper (one chunk up to 5000 records)
+      - name: Run scraper (up to 50k records)
         env:
           API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
           API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
