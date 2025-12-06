@@ -37,7 +37,7 @@ OUTPUT_DIR = "exports"
 TARGET_LAST_PAGE = 5000
 
 # ✅ عدد السجلات المطلوب جمعها في كل Run
-RECORDS_PER_RUN = 5000
+RECORDS_PER_RUN = 50000
 # =====================================
 
 # ==== Allow env override from CI Secrets ====
