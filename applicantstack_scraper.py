@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =================== CONFIG ===================
-# NOTE: القيم دي هتتغلب عليها تلقائيًا من Secrets لو اتوفرت (سطرين تحت بعد التعريفات)
+# NOTE: ممكن تتغطى من Secrets في GitHub Actions (هنعمل override تحت)
 API_TOKEN =  "sonuwlfuefnrt5be8ti99puw5qc7yt7qe0dqg7gs"
 API_PUBLISHER = "TheProf"
 
@@ -31,8 +31,8 @@ MAX_WORKERS = 1
 # ====== NEW: State/Run settings ======
 STATE_FILE = "applicantstack_state.json"
 OUTPUT_DIR = "exports"
-TARGET_TOTAL_RECORDS = 5000        # الهدف النهائي
 PAGES_PER_RUN = 10                 # كل Run هنجمع كام صفحة
+TARGET_LAST_PAGE = 5000            # ✅ هنوقف عند الصفحة 5000 (أو آخر صفحة متاحة، أيهما أصغر)
 # =====================================
 
 # ==== Allow env override from CI Secrets ====
@@ -218,7 +218,8 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"current_page": 1, "total_pages": None, "total_saved": 0, "completed": False}
+    # مابقيناش نحتاج total_saved (هنوقف بالصفحة مش بعدّ السجلات)
+    return {"current_page": 1, "total_pages": None, "completed": False}
 
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -257,7 +258,7 @@ def main():
 
     state = load_state()
     if state.get("completed"):
-        print("✅ Target reached earlier. Nothing to do.")
+        print("✅ Target page reached earlier. Nothing to do.")
         return
 
     # اجمع إجمالي الصفحات أول مرة فقط
@@ -266,41 +267,36 @@ def main():
         save_state(state)
 
     total_pages = state["total_pages"]
-    current_page = state["current_page"]
-    total_saved = state["total_saved"]
+    current_page = state.get("current_page", 1)
 
-    # لو وصل الهدف، اقفل
-    if total_saved >= TARGET_TOTAL_RECORDS:
+    # هنقف عند أصغر رقم بين: آخر صفحة متاحة، و TARGET_LAST_PAGE
+    max_page = min(total_pages, TARGET_LAST_PAGE)
+
+    # لو عدّينا الحد—اقفل
+    if current_page > max_page:
+        print(f"✅ Reached last page limit: {max_page}. Stopping.")
         state["completed"] = True
         save_state(state)
-        print(f"✅ Already hit {TARGET_TOTAL_RECORDS}.")
         return
 
     # حدد رينج الصفحات لRun واحدة
     start_page = current_page
-    end_page = min(current_page + PAGES_PER_RUN - 1, total_pages)
-    if start_page > total_pages:
-        print(f"All {total_pages} pages fetched previously.")
-        state["completed"] = True
-        save_state(state)
-        return
+    end_page = min(current_page + PAGES_PER_RUN - 1, max_page)
 
-    print(f"Fetching pages {start_page}..{end_page}")
+    print(f"Fetching pages {start_page}..{end_page} (max_page={max_page})")
     batch = get_candidates_data_in_range(start_page, end_page)
 
     # ملف Excel جديد للداتا الحالية فقط
-    added_this_run = save_run_to_new_excel(batch)
+    _ = save_run_to_new_excel(batch)
 
-    # حدّث الحالة
-    state["total_saved"] = total_saved + added_this_run
+    # حدّث الحالة (نتقدم بالصفحات فقط)
     state["current_page"] = end_page + 1
-
-    if state["total_saved"] >= TARGET_TOTAL_RECORDS or state["current_page"] > total_pages:
+    if state["current_page"] > max_page:
         state["completed"] = True
-        print(f"✅ Target reached or no more pages. total_saved={state['total_saved']}.")
+        print(f"✅ Target last page reached: {max_page}.")
 
     save_state(state)
-    print(f"Progress: {state['total_saved']}/{TARGET_TOTAL_RECORDS}. Next page: {state['current_page']}")
+    print(f"Progress: next_page={state['current_page']} / limit_page={max_page}")
 
 if __name__ == "__main__":
     main()
