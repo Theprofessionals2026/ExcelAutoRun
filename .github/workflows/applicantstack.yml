@@ -5,7 +5,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: write   # لازم علشان نقدر نعمل push
 
 concurrency:
   group: applicantstack-cron
@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true   # مهم علشان push
 
       - uses: actions/setup-python@v5
         with:
@@ -26,23 +27,48 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run scraper (one chunk)
+      # DEBUG: اتأكد إن السيكرتس واصلة للبيئة
+      - name: Debug secrets presence
+        run: |
+          python - << 'PY'
+          import os
+          print("TOKEN_SET =", bool(os.getenv("API_TOKEN")))
+          print("PUBLISHER_SET =", bool(os.getenv("API_PUBLISHER")))
+          PY
         env:
           API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
           API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
+
+      # (اختياري) شغّلها مرة واحدة لو عايز تصفّر الحالة
+      # - name: Reset state (one-off)
+      #   run: rm -f applicantstack_state.json
+
+      - name: Run scraper (one chunk up to 5000 records)
+        env:
+          API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
+          API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
+          MAX_WORKERS: "8"
         run: |
           python applicantstack_scraper.py
 
-      # Commit new Excel files + state
+      # شوف هل اتولد ملف فعلاً
+      - name: List workspace and exports
+        run: |
+          ls -la
+          mkdir -p exports
+          ls -la exports || true
+
+      # اعمل commit للملفات الجديدة فقط لو في حاجة اتغيّرت
       - name: Commit Excel outputs & state
+        if: ${{ hashFiles('exports/*.xlsx') != '' || hashFiles('applicantstack_state.json') != '' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add exports/*.xlsx applicantstack_state.json || true
+          git add -A exports applicantstack_state.json
           git diff --cached --quiet || git commit -m "Run @ $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push
 
-      # Optional: upload artifacts for quick download
+      # Artifact للتحميل السريع (حتى لو commit اتمنع بسبب قواعد البرانش)
       - name: Upload Excel artifacts
         if: always()
         uses: actions/upload-artifact@v4
