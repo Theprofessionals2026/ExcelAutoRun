@@ -1,11 +1,11 @@
-name: ApplicantStack every 30m
+name: ApplicantStack every 3h30m
 on:
   schedule:
-    - cron: "*/30 * * * *"   # UTC: كل 30 دقيقة
+    - cron: "*/30 * * * *"   # UTC: فحص كل 30 دقيقة + Gate يمنع التشغيل قبل 3.5 ساعة
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # لازم علشان نقدر نعمل push
+  contents: write
 
 # يمنع تداخل الرنز: الجديدة هتستنى لحد ما الحالية تخلص
 concurrency:
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true   # مهم علشان push
+          persist-credentials: true
 
       - uses: actions/setup-python@v5
         with:
@@ -29,7 +29,6 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # DEBUG: اتأكد إن السيكرتس واصلة للبيئة
       - name: Debug secrets presence
         run: |
           python - << 'PY'
@@ -41,11 +40,40 @@ jobs:
           API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
           API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
 
-      # (اختياري) شغّلها مرة واحدة لو عايز تصفّر الحالة
-      # - name: Reset state (one-off)
-      #   run: rm -f applicantstack_state.json
+      # Gate: ماتشغّلش السكربت إلا لو عدّى >= 210 دقيقة من آخر Run ناجحة
+      - name: Gate (enforce 3h30m spacing)
+        id: gate
+        run: |
+          python - << 'PY'
+          import json, os
+          from datetime import datetime, timezone
+          p = "applicantstack_state.json"
+          skip = "false"
+          if os.path.exists(p):
+            try:
+              with open(p, "r", encoding="utf-8") as f:
+                st = json.load(f)
+              last = st.get("last_run_utc")
+              if last:
+                try:
+                  # دعم both "...Z" أو ISO بدون Z
+                  if last.endswith("Z"):
+                    last = last[:-1]
+                  dt = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+                  mins = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+                  if mins < 210:  # 3.5 ساعات
+                    skip = "true"
+                except Exception:
+                  pass
+            except Exception:
+              pass
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"skip={skip}\n")
+          print("SKIP =", skip)
+          PY
 
       - name: Run scraper (up to 50k records)
+        if: steps.gate.outputs.skip != 'true'
         env:
           API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
           API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
@@ -53,14 +81,32 @@ jobs:
         run: |
           python applicantstack_scraper.py
 
-      # شوف هل اتولد ملف فعلاً
+      # بعد التشغيل الناجح حدّث last_run_utc في state
+      - name: Update last_run_utc
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          python - << 'PY'
+          import json, os
+          from datetime import datetime, timezone
+          p = "applicantstack_state.json"
+          st = {}
+          if os.path.exists(p):
+            try:
+              with open(p, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            except Exception:
+              st = {}
+          st["last_run_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+          with open(p, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+          PY
+
       - name: List workspace and exports
         run: |
           ls -la
           mkdir -p exports
           ls -la exports || true
 
-      # اعمل commit للملفات الجديدة فقط لو في حاجة اتغيّرت
       - name: Commit Excel outputs & state
         if: ${{ hashFiles('exports/*.xlsx') != '' || hashFiles('applicantstack_state.json') != '' }}
         run: |
@@ -70,7 +116,6 @@ jobs:
           git diff --cached --quiet || git commit -m "Run @ $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push
 
-      # Artifact للتحميل السريع (حتى لو commit اتمنع بسبب قواعد البرانش)
       - name: Upload Excel artifacts
         if: always()
         uses: actions/upload-artifact@v4
