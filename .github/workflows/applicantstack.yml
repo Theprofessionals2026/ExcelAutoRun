@@ -1,21 +1,29 @@
-name: ApplicantStack every 3h30m
+name: ApplicantStack scraper (cron + manual range)
+
 on:
   schedule:
-    - cron: "*/30 * * * *"   # UTC: فحص كل 30 دقيقة + Gate يمنع التشغيل قبل 3.5 ساعة
-  workflow_dispatch: {}
+    - cron: "0 */3 * * *"   # (كما هو/اختياري)
+  workflow_dispatch:
+    inputs:
+      start_page:
+        description: "Start page (e.g. 4500)"
+        required: true
+        default: "4500"
+      end_page:
+        description: "End page (e.g. 5000)"
+        required: true
+        default: "5000"
 
 permissions:
   contents: write
 
-# يمنع تداخل الرنز: الجديدة هتستنى لحد ما الحالية تخلص
 concurrency:
   group: applicantstack-cron
-  cancel-in-progress: false
+  cancel-in-progress: true   # يمنع تداخل الرنز
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,79 +37,16 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Debug secrets presence
-        run: |
-          python - << 'PY'
-          import os
-          print("TOKEN_SET =", bool(os.getenv("API_TOKEN")))
-          print("PUBLISHER_SET =", bool(os.getenv("API_PUBLISHER")))
-          PY
-        env:
-          API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
-          API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
-
-      # Gate: ماتشغّلش السكربت إلا لو عدّى >= 210 دقيقة من آخر Run ناجحة
-      - name: Gate (enforce 3h30m spacing)
-        id: gate
-        run: |
-          python - << 'PY'
-          import json, os
-          from datetime import datetime, timezone
-          p = "applicantstack_state.json"
-          skip = "false"
-          if os.path.exists(p):
-            try:
-              with open(p, "r", encoding="utf-8") as f:
-                st = json.load(f)
-              last = st.get("last_run_utc")
-              if last:
-                try:
-                  # دعم both "...Z" أو ISO بدون Z
-                  if last.endswith("Z"):
-                    last = last[:-1]
-                  dt = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
-                  mins = (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
-                  if mins < 210:  # 3.5 ساعات
-                    skip = "true"
-                except Exception:
-                  pass
-            except Exception:
-              pass
-          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-            fh.write(f"skip={skip}\n")
-          print("SKIP =", skip)
-          PY
-
-      - name: Run scraper (up to 50k records)
-        if: steps.gate.outputs.skip != 'true'
+      - name: Run scraper (cron OR manual range)
         env:
           API_TOKEN: ${{ secrets.APPLICANTSTACK_TOKEN }}
           API_PUBLISHER: ${{ secrets.APPLICANTSTACK_PUBLISHER }}
           MAX_WORKERS: "8"
-        run: |
-          python applicantstack_scraper.py
+          START_PAGE: ${{ github.event.inputs.start_page }}
+          END_PAGE: ${{ github.event.inputs.end_page }}
+        run: python applicantstack_scraper.py
 
-      # بعد التشغيل الناجح حدّث last_run_utc في state
-      - name: Update last_run_utc
-        if: steps.gate.outputs.skip != 'true'
-        run: |
-          python - << 'PY'
-          import json, os
-          from datetime import datetime, timezone
-          p = "applicantstack_state.json"
-          st = {}
-          if os.path.exists(p):
-            try:
-              with open(p, "r", encoding="utf-8") as f:
-                st = json.load(f)
-            except Exception:
-              st = {}
-          st["last_run_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-          with open(p, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-          PY
-
-      - name: List workspace and exports
+      - name: List outputs
         run: |
           ls -la
           mkdir -p exports
