@@ -36,7 +36,7 @@ OUTPUT_DIR = "exports"
 # ✅ هنوقف عند الصفحة 5000 كحد أقصى (أو عند آخر صفحة متاحة إن كانت أقل)
 TARGET_LAST_PAGE = 5000
 
-# ✅ عدد السجلات المطلوب جمعها في كل Run
+# ✅ عدد السجلات المطلوب جمعها في كل Run (لو شغال بوضع الـstate)
 RECORDS_PER_RUN = 50000
 # =====================================
 
@@ -46,6 +46,39 @@ API_PUBLISHER = os.getenv("API_PUBLISHER", API_PUBLISHER)
 HEADERS["token"] = API_TOKEN
 HEADERS["publisher"] = API_PUBLISHER
 # ============================================
+
+def scrape_pages_range(start_page: int, end_page: int) -> Tuple[List[Dict[str, Any]], int]:
+    all_details: List[Dict[str, Any]] = []
+    last_page = start_page - 1
+    for page in range(start_page, end_page + 1):
+        print(f"Processing page {page}...")
+        page_candidates = fetch_page_candidates(page)
+        last_page = page
+        if not page_candidates:
+            print("  -> No candidates or fetch failed for this page. Continue.")
+            continue
+
+        candidate_ids: List[str] = []
+        for summary in page_candidates:
+            cid = None
+            if isinstance(summary, dict):
+                cid = summary.get("Candidate Serial") or summary.get("id") or summary.get("candidate_id")
+            if isinstance(cid, (str, int)) and str(cid).strip():
+                candidate_ids.append(str(cid))
+            else:
+                all_details.append({"summary_error": "Valid ID not found in summary", **summary})
+
+        print(f"  -> Fetching details for {len(candidate_ids)} candidates concurrently (workers={MAX_WORKERS})...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            fut = {ex.submit(fetch_candidate_detail, x): x for x in candidate_ids}
+            for f in as_completed(fut):
+                try:
+                    all_details.append(f.result())
+                except Exception as exc:
+                    print(f"  -> Detail fetch exception: {exc}")
+
+    print(f"\n✅ Collected {len(all_details)} records from pages {start_page}..{end_page}.")
+    return all_details, last_page
 
 def clean_excel_name(name: str) -> str:
     invalid_chars = r'[\\/?"*:[\]]'
@@ -206,7 +239,6 @@ def collect_candidates_until(target_records: int, start_page: int, max_page: int
             if isinstance(candidate_id, (str, int)) and str(candidate_id).strip():
                 candidate_ids.append(str(candidate_id))
             else:
-                # لو مفيش ID صالح، خليه يدخل كصف “مشروح” برضه
                 all_details.append({"summary_error": "Valid ID not found in summary", **summary})
 
         print(f"  -> Fetching details for {len(candidate_ids)} candidates concurrently (workers={MAX_WORKERS})...")
@@ -222,7 +254,6 @@ def collect_candidates_until(target_records: int, start_page: int, max_page: int
                     cid = future_to_id[future]
                     print(f"  -> Detail fetch for Candidate {cid} generated an exception: {exc}")
 
-    # لو زاد عدد العناصر عن المطلوب (بسبب آخر صفحة)، قصّه لـ target_records بالظبط
     if len(all_details) > target_records:
         all_details = all_details[:target_records]
 
@@ -237,7 +268,6 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    # مش بنعدّ سجلات تراكمية دلوقتي؛ التركيز على تقدّم الصفحات
     return {"current_page": 1, "total_pages": None, "completed": False}
 
 def save_state(state: dict):
@@ -269,29 +299,50 @@ def save_run_to_new_excel(data: List[Dict[str, Any]]) -> int:
         return 0
 
 def main():
-    print("--- ApplicantStack Chunk Runner (every 15 min) ---")
+    print("--- ApplicantStack Chunk Runner ---")
 
     if not API_TOKEN or not API_PUBLISHER:
         print("!!! Please set API_TOKEN & API_PUBLISHER.")
         return
 
+    # ========== وضع “مدى صفحات” إجباري عبر env ==========
+    sp_env = os.getenv("START_PAGE")
+    ep_env = os.getenv("END_PAGE")
+    if sp_env and ep_env:
+        try:
+            sp = max(1, int(sp_env))
+            ep = max(sp, int(ep_env))
+        except ValueError:
+            print("Invalid START_PAGE/END_PAGE; falling back to state mode.")
+        else:
+            # اختياري: سقّف للحد الأقصى 5000، وكمان للعدد الحقيقي من API
+            total_pages = get_total_pages()
+            limit_page = min(total_pages, TARGET_LAST_PAGE)
+            ep = min(ep, limit_page)
+            if sp > limit_page:
+                print(f"Start page {sp} > available limit {limit_page}. Nothing to do.")
+                return
+            print(f"Forced range mode: pages {sp}..{ep} (limit_page={limit_page})")
+            batch, _ = scrape_pages_range(sp, ep)
+            save_run_to_new_excel(batch)
+            print("Done forced range.")
+            return
+    # ======================================================
+
+    # ======= وضع الـstate المعتاد =======
     state = load_state()
     if state.get("completed"):
         print("✅ Target last page reached earlier. Nothing to do.")
         return
 
-    # اجمع إجمالي الصفحات أول مرة فقط
     if not state.get("total_pages"):
         state["total_pages"] = get_total_pages()
         save_state(state)
 
     total_pages = state["total_pages"]
     current_page = state.get("current_page", 1)
-
-    # هنقف عند أصغر رقم بين: آخر صفحة متاحة، و TARGET_LAST_PAGE
     max_page = min(total_pages, TARGET_LAST_PAGE)
 
-    # لو عدّينا الحد—اقفل
     if current_page > max_page:
         print(f"✅ Reached last page limit: {max_page}. Stopping.")
         state["completed"] = True
@@ -300,17 +351,14 @@ def main():
 
     print(f"Collecting up to {RECORDS_PER_RUN} records in this run (pages {current_page}..{max_page})")
 
-    # ⭐ اجمع لحد 5000 سجل أو نهاية الصفحات
     batch, last_page = collect_candidates_until(
         target_records=RECORDS_PER_RUN,
         start_page=current_page,
         max_page=max_page
     )
 
-    # ملف Excel جديد للداتا الحالية فقط
     _ = save_run_to_new_excel(batch)
 
-    # حدّث الحالة: نتقدم بالصفحات فقط
     next_page = (last_page + 1) if last_page >= current_page else current_page
     state["current_page"] = next_page
     if state["current_page"] > max_page:
