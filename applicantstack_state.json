@@ -1,6 +1,7 @@
 {
-  "current_page": 5001,
-  "total_pages": 6730,
-  "completed": true,
-  "last_run_utc": "2025-12-14T21:14:42.787689Z"
+  "mode": "incremental_ready",
+  "seen_ids_total": 50000,
+  "backlog_incomplete": false,
+  "next_scan_page": 1,
+  "note": "Initial checkpoint was built from the first historical export, which covers the newest previously downloaded candidates."
 }

@@ -4,14 +4,15 @@ import json
 import time
 import os
 import re
-from typing import List, Dict, Any, Union, Tuple
+from typing import List, Dict, Any, Union, Tuple, Set, Optional
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # =================== CONFIG ===================
 # NOTE: ممكن تتغطى من Secrets في GitHub Actions (override تحت)
-API_TOKEN =  "sonuwlfuefnrt5be8ti99puw5qc7yt7qe0dqg7gs"
-API_PUBLISHER = "TheProf"
+API_TOKEN = ""
+API_PUBLISHER = ""
 
 BASE_URL = "https://theprofessionals.applicantstack.com/api"
 CANDIDATES_LIST_URL = f"{BASE_URL}/candidates"
@@ -31,7 +32,13 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 
 # ====== State / Run settings ======
 STATE_FILE = "applicantstack_state.json"
+SEEN_IDS_FILE = "applicantstack_seen_ids.txt"
 OUTPUT_DIR = "exports"
+
+# Incremental sync settings. The runner checks newest pages first and stops
+# after this many consecutive pages contain only candidates already exported.
+STOP_AFTER_KNOWN_PAGES = int(os.getenv("STOP_AFTER_KNOWN_PAGES", "5"))
+MAX_INCREMENTAL_PAGES = int(os.getenv("MAX_INCREMENTAL_PAGES", "100"))
 
 # ✅ هنوقف عند الصفحة 5000 كحد أقصى (أو عند آخر صفحة متاحة إن كانت أقل)
 TARGET_LAST_PAGE = 5000
@@ -260,6 +267,200 @@ def collect_candidates_until(target_records: int, start_page: int, max_page: int
     print(f"\n✅ Collected {len(all_details)} records in this run.")
     return all_details, last_page
 
+# ============ INCREMENTAL SYNC HELPERS ============
+def extract_candidate_id(item: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(item, dict):
+        return None
+    value = item.get("Candidate Serial") or item.get("id") or item.get("candidate_id")
+    if isinstance(value, (str, int)) and str(value).strip():
+        return str(value).strip()
+    return None
+
+
+def load_seen_ids() -> Set[str]:
+    """Load the lightweight persistent set of candidate IDs."""
+    path = Path(SEEN_IDS_FILE)
+    if not path.exists():
+        return set()
+    return {
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+
+
+def save_seen_ids(seen_ids: Set[str]) -> None:
+    """Write IDs atomically so an interrupted run cannot corrupt the checkpoint."""
+    path = Path(SEEN_IDS_FILE)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text("\n".join(sorted(seen_ids)) + "\n", encoding="utf-8")
+    temp_path.replace(path)
+
+
+def bootstrap_seen_ids_from_exports() -> Set[str]:
+    """
+    One-time migration: build the ID checkpoint from existing Excel exports.
+    Later runs load the text file directly and do not scan Excel files again.
+    """
+    seen_ids: Set[str] = set()
+    export_files = sorted(Path(OUTPUT_DIR).glob("applicantstack_*.xlsx"))
+    if not export_files:
+        print("No existing exports found; starting with an empty seen-ID set.")
+        return seen_ids
+
+    print(f"Bootstrapping seen IDs from {len(export_files)} existing Excel file(s)...")
+    for excel_file in export_files:
+        try:
+            header = pd.read_excel(excel_file, nrows=0)
+            candidate_column = next(
+                (col for col in header.columns if str(col).strip().lower() == "candidate serial"),
+                None,
+            )
+            if candidate_column is None:
+                print(f"  -> Skipping {excel_file.name}: Candidate Serial column not found.")
+                continue
+            frame = pd.read_excel(excel_file, usecols=[candidate_column])
+            ids = (
+                frame[candidate_column]
+                .dropna()
+                .astype(str)
+                .str.strip()
+            )
+            # Excel sometimes converts integer-looking IDs to values ending in .0.
+            ids = ids.str.replace(r"^([0-9]+)\.0$", r"\1", regex=True)
+            seen_ids.update(value for value in ids if value)
+            print(f"  -> {excel_file.name}: checkpoint now has {len(seen_ids)} IDs.")
+        except Exception as exc:
+            print(f"  -> Could not read {excel_file.name}: {exc}")
+
+    if seen_ids:
+        save_seen_ids(seen_ids)
+        print(f"✅ Created {SEEN_IDS_FILE} with {len(seen_ids)} unique IDs.")
+    return seen_ids
+
+
+def ensure_seen_ids() -> Set[str]:
+    seen_ids = load_seen_ids()
+    if seen_ids:
+        print(f"Loaded {len(seen_ids)} previously exported candidate IDs.")
+        return seen_ids
+    return bootstrap_seen_ids_from_exports()
+
+
+def fetch_new_candidate_details(candidate_ids: List[str]) -> Tuple[List[Dict[str, Any]], Set[str], List[str]]:
+    """Fetch only unseen candidates. Failed IDs are deliberately not checkpointed."""
+    details: List[Dict[str, Any]] = []
+    successful_ids: Set[str] = set()
+    failed_ids: List[str] = []
+
+    if not candidate_ids:
+        return details, successful_ids, failed_ids
+
+    print(f"  -> Fetching details for {len(candidate_ids)} NEW candidates (workers={MAX_WORKERS})...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_id = {
+            executor.submit(fetch_candidate_detail, candidate_id): candidate_id
+            for candidate_id in candidate_ids
+        }
+        for future in as_completed(future_to_id):
+            candidate_id = future_to_id[future]
+            try:
+                detail = future.result()
+                if not isinstance(detail, dict) or detail.get("detail_fetch_error"):
+                    failed_ids.append(candidate_id)
+                    print(f"  -> Candidate {candidate_id} detail failed; it will be retried next run.")
+                    continue
+                details.append(detail)
+                successful_ids.add(candidate_id)
+            except Exception as exc:
+                failed_ids.append(candidate_id)
+                print(f"  -> Candidate {candidate_id} detail exception: {exc}")
+
+    return details, successful_ids, failed_ids
+
+
+def collect_incremental_candidates(
+    seen_ids: Set[str],
+    total_pages: int,
+    resume_page: int = 1,
+) -> Tuple[List[Dict[str, Any]], Set[str], Dict[str, Any]]:
+    """
+    Scan from page 1 because new candidates are expected at the front of ApplicantStack.
+    List pages are cheap; detail calls are made only for unseen IDs.
+    """
+    all_details: List[Dict[str, Any]] = []
+    successful_new_ids: Set[str] = set()
+    failed_pages: List[int] = []
+    failed_candidate_ids: List[str] = []
+    known_page_streak = 0
+    pages_checked = 0
+    stop_reason = "all available pages checked"
+    run_seen_ids = set(seen_ids)
+
+    resume_page = max(1, resume_page)
+    scan_start = max(1, resume_page - 2) if resume_page > 1 else 1
+    page_limit = min(total_pages, scan_start + MAX_INCREMENTAL_PAGES - 1)
+    for page in range(scan_start, page_limit + 1):
+        print(f"Checking incremental page {page}/{total_pages}...")
+        summaries = fetch_page_candidates(page)
+        pages_checked = page
+
+        if summaries is None:
+            failed_pages.append(page)
+            known_page_streak = 0
+            print("  -> Page failed or returned no usable list; not counted as a known page.")
+            continue
+
+        page_ids = []
+        for summary in summaries:
+            candidate_id = extract_candidate_id(summary)
+            if candidate_id:
+                page_ids.append(candidate_id)
+
+        # Preserve order while removing duplicates.
+        page_ids = list(dict.fromkeys(page_ids))
+        new_ids = [candidate_id for candidate_id in page_ids if candidate_id not in run_seen_ids]
+        print(f"  -> {len(new_ids)} new / {len(page_ids)} total IDs on page {page}.")
+
+        if new_ids:
+            known_page_streak = 0
+            details, successful_ids, failed_ids = fetch_new_candidate_details(new_ids)
+            all_details.extend(details)
+            successful_new_ids.update(successful_ids)
+            failed_candidate_ids.extend(failed_ids)
+            # Avoid requesting a successful candidate twice in the same run.
+            run_seen_ids.update(successful_ids)
+        elif page >= resume_page:
+            # Overlap pages before resume_page protect against pagination shifts,
+            # but must not prematurely stop a backlog continuation run.
+            known_page_streak += 1
+            print(f"  -> Fully known page streak: {known_page_streak}/{STOP_AFTER_KNOWN_PAGES}")
+
+        if known_page_streak >= STOP_AFTER_KNOWN_PAGES:
+            stop_reason = f"{STOP_AFTER_KNOWN_PAGES} consecutive fully-known pages"
+            break
+    else:
+        if page_limit < total_pages:
+            stop_reason = f"safety page limit reached ({MAX_INCREMENTAL_PAGES})"
+
+    backlog_incomplete = stop_reason.startswith("safety page limit")
+    next_scan_page = (pages_checked + 1) if backlog_incomplete else 1
+
+    summary = {
+        "mode": "incremental",
+        "pages_checked": pages_checked,
+        "new_candidates_found": len(successful_new_ids) + len(set(failed_candidate_ids)),
+        "new_candidates_saved": len(successful_new_ids),
+        "failed_pages": failed_pages,
+        "failed_candidate_ids": sorted(set(failed_candidate_ids)),
+        "known_page_streak": known_page_streak,
+        "stop_reason": stop_reason,
+        "backlog_incomplete": backlog_incomplete,
+        "next_scan_page": next_scan_page,
+    }
+    return all_details, successful_new_ids, summary
+
+
 # ============ STATE HELPERS ============
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -299,74 +500,83 @@ def save_run_to_new_excel(data: List[Dict[str, Any]]) -> int:
         return 0
 
 def main():
-    print("--- ApplicantStack Chunk Runner ---")
+    print("--- ApplicantStack Smart Incremental Runner ---")
 
     if not API_TOKEN or not API_PUBLISHER:
-        print("!!! Please set API_TOKEN & API_PUBLISHER.")
+        print("!!! Missing API_TOKEN or API_PUBLISHER. Configure GitHub repository secrets.")
         return
 
-    # ========== وضع “مدى صفحات” إجباري عبر env ==========
-    sp_env = os.getenv("START_PAGE")
-    ep_env = os.getenv("END_PAGE")
-    if sp_env and ep_env:
+    run_mode = os.getenv("RUN_MODE", "incremental").strip().lower()
+
+    # Manual range remains available for recovery/backfill jobs only.
+    if run_mode == "manual_range":
+        sp_env = os.getenv("START_PAGE")
+        ep_env = os.getenv("END_PAGE")
+        if not sp_env or not ep_env:
+            print("Manual range mode requires START_PAGE and END_PAGE.")
+            return
         try:
             sp = max(1, int(sp_env))
             ep = max(sp, int(ep_env))
         except ValueError:
-            print("Invalid START_PAGE/END_PAGE; falling back to state mode.")
-        else:
-            # اختياري: سقّف للحد الأقصى 5000، وكمان للعدد الحقيقي من API
-            total_pages = get_total_pages()
-            limit_page = min(total_pages, TARGET_LAST_PAGE)
-            ep = min(ep, limit_page)
-            if sp > limit_page:
-                print(f"Start page {sp} > available limit {limit_page}. Nothing to do.")
-                return
-            print(f"Forced range mode: pages {sp}..{ep} (limit_page={limit_page})")
-            batch, _ = scrape_pages_range(sp, ep)
-            save_run_to_new_excel(batch)
-            print("Done forced range.")
+            print("Invalid START_PAGE/END_PAGE.")
             return
-    # ======================================================
 
-    # ======= وضع الـstate المعتاد =======
-    state = load_state()
-    if state.get("completed"):
-        print("✅ Target last page reached earlier. Nothing to do.")
+        total_pages = get_total_pages()
+        ep = min(ep, total_pages)
+        if sp > total_pages:
+            print(f"Start page {sp} > total pages {total_pages}. Nothing to do.")
+            return
+        print(f"Manual range mode: pages {sp}..{ep}")
+        batch, last_page = scrape_pages_range(sp, ep)
+        saved_rows = save_run_to_new_excel(batch)
+        save_state({
+            "mode": "manual_range",
+            "start_page": sp,
+            "end_page": ep,
+            "last_page_attempted": last_page,
+            "records_saved": saved_rows,
+            "last_run_utc": datetime.utcnow().isoformat() + "Z",
+        })
         return
 
-    if not state.get("total_pages"):
-        state["total_pages"] = get_total_pages()
-        save_state(state)
-
-    total_pages = state["total_pages"]
-    current_page = state.get("current_page", 1)
-    max_page = min(total_pages, TARGET_LAST_PAGE)
-
-    if current_page > max_page:
-        print(f"✅ Reached last page limit: {max_page}. Stopping.")
-        state["completed"] = True
-        save_state(state)
-        return
-
-    print(f"Collecting up to {RECORDS_PER_RUN} records in this run (pages {current_page}..{max_page})")
-
-    batch, last_page = collect_candidates_until(
-        target_records=RECORDS_PER_RUN,
-        start_page=current_page,
-        max_page=max_page
+    # Default and scheduled mode: smart incremental sync.
+    seen_ids = ensure_seen_ids()
+    previous_state = load_state()
+    resume_page = (
+        int(previous_state.get("next_scan_page", 1))
+        if previous_state.get("backlog_incomplete")
+        else 1
+    )
+    total_pages = get_total_pages()
+    details, successful_new_ids, run_summary = collect_incremental_candidates(
+        seen_ids=seen_ids,
+        total_pages=total_pages,
+        resume_page=resume_page,
     )
 
-    _ = save_run_to_new_excel(batch)
+    saved_rows = save_run_to_new_excel(details)
 
-    next_page = (last_page + 1) if last_page >= current_page else current_page
-    state["current_page"] = next_page
-    if state["current_page"] > max_page:
-        state["completed"] = True
-        print(f"✅ Target last page reached: {max_page}.")
+    # Only checkpoint IDs after their details were fetched AND the Excel was saved.
+    if saved_rows > 0:
+        seen_ids.update(successful_new_ids)
+        save_seen_ids(seen_ids)
+        print(f"✅ Checkpoint updated: {len(seen_ids)} total exported candidate IDs.")
+    elif successful_new_ids:
+        print("⚠️ Excel was not saved, so new IDs were NOT checkpointed and will be retried.")
 
-    save_state(state)
-    print(f"Progress: next_page={state['current_page']} / limit_page={max_page}")
+    run_summary.update({
+        "total_pages_at_run": total_pages,
+        "records_saved": saved_rows,
+        "seen_ids_total": len(seen_ids),
+        "last_run_utc": datetime.utcnow().isoformat() + "Z",
+    })
+    save_state(run_summary)
+
+    if saved_rows == 0:
+        print("✅ No new ApplicantStack candidates found.")
+    print(f"Run summary: {json.dumps(run_summary, ensure_ascii=False)}")
+
 
 if __name__ == "__main__":
     main()
