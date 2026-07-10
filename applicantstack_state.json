@@ -1,7 +1,16 @@
 {
-  "mode": "incremental_ready",
-  "seen_ids_total": 50000,
+  "mode": "incremental",
+  "pages_checked": 5,
+  "new_candidates_found": 0,
+  "new_candidates_saved": 0,
+  "failed_pages": [],
+  "failed_candidate_ids": [],
+  "known_page_streak": 5,
+  "stop_reason": "5 consecutive fully-known pages",
   "backlog_incomplete": false,
   "next_scan_page": 1,
-  "note": "Initial checkpoint was built from the first historical export, which covers the newest previously downloaded candidates."
+  "total_pages_at_run": 6815,
+  "records_saved": 0,
+  "seen_ids_total": 50000,
+  "last_run_utc": "2026-07-10T23:27:35.008502Z"
 }
