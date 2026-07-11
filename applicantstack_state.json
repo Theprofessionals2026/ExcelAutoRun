@@ -1,25 +1,17 @@
 {
-<<<<<<< HEAD
-  "mode": "tail_incremental_ready",
-  "backlog_incomplete": true,
-  "next_scan_page": 5001,
-  "seen_ids_total": 50000,
-  "note": "Continue after the historical export that ended at page 5000. The runner uses a 2-page overlap and Candidate Serial deduplication."
-}
-=======
-  "mode": "incremental",
-  "pages_checked": 5,
-  "new_candidates_found": 0,
-  "new_candidates_saved": 0,
+  "mode": "tail_incremental",
+  "scan_start_page": 4999,
+  "last_page_checked": 5100,
+  "pages_checked_count": 102,
+  "new_candidates_found": 10200,
+  "new_candidates_saved": 10200,
   "failed_pages": [],
   "failed_candidate_ids": [],
-  "known_page_streak": 5,
-  "stop_reason": "5 consecutive fully-known pages",
-  "backlog_incomplete": false,
-  "next_scan_page": 1,
+  "stop_reason": "batch page limit reached (100)",
+  "backlog_incomplete": true,
+  "next_scan_page": 5101,
   "total_pages_at_run": 6815,
-  "records_saved": 0,
-  "seen_ids_total": 50000,
-  "last_run_utc": "2026-07-10T23:27:35.008502Z"
+  "records_saved": 10200,
+  "seen_ids_total": 60200,
+  "last_run_utc": "2026-07-11T00:44:00.137414Z"
 }
->>>>>>> b515d3799116b1241629b5f1b57378279ba3697d
