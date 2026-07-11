@@ -1,7 +1,7 @@
 {
-  "mode": "incremental_ready",
+  "mode": "tail_incremental_ready",
+  "backlog_incomplete": true,
+  "next_scan_page": 5001,
   "seen_ids_total": 50000,
-  "backlog_incomplete": false,
-  "next_scan_page": 1,
-  "note": "Initial checkpoint was built from the first historical export, which covers the newest previously downloaded candidates."
+  "note": "Continue after the historical export that ended at page 5000. The runner uses a 2-page overlap and Candidate Serial deduplication."
 }

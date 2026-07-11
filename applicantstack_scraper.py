@@ -35,9 +35,8 @@ STATE_FILE = "applicantstack_state.json"
 SEEN_IDS_FILE = "applicantstack_seen_ids.txt"
 OUTPUT_DIR = "exports"
 
-# Incremental sync settings. The runner checks newest pages first and stops
-# after this many consecutive pages contain only candidates already exported.
-STOP_AFTER_KNOWN_PAGES = int(os.getenv("STOP_AFTER_KNOWN_PAGES", "5"))
+# Tail/cursor incremental settings. Each run processes a safe page batch and
+# continues automatically from the saved cursor on the next run.
 MAX_INCREMENTAL_PAGES = int(os.getenv("MAX_INCREMENTAL_PAGES", "100"))
 
 # ✅ هنوقف عند الصفحة 5000 كحد أقصى (أو عند آخر صفحة متاحة إن كانت أقل)
@@ -382,78 +381,93 @@ def fetch_new_candidate_details(candidate_ids: List[str]) -> Tuple[List[Dict[str
 def collect_incremental_candidates(
     seen_ids: Set[str],
     total_pages: int,
-    resume_page: int = 1,
+    resume_page: int,
 ) -> Tuple[List[Dict[str, Any]], Set[str], Dict[str, Any]]:
     """
-    Scan from page 1 because new candidates are expected at the front of ApplicantStack.
-    List pages are cheap; detail calls are made only for unseen IDs.
+    Tail/cursor incremental sync for this ApplicantStack account.
+
+    The API is ordered from older pages to newer pages, so new candidates are
+    appended near the end. We therefore continue from the last unprocessed
+    page, with a small overlap to catch a partially-filled page or pagination
+    movement. Candidate Serial remains the final deduplication key.
     """
     all_details: List[Dict[str, Any]] = []
     successful_new_ids: Set[str] = set()
     failed_pages: List[int] = []
     failed_candidate_ids: List[str] = []
-    known_page_streak = 0
-    pages_checked = 0
-    stop_reason = "all available pages checked"
+    pages_checked_count = 0
+    last_page_checked = max(0, resume_page - 1)
     run_seen_ids = set(seen_ids)
 
+    overlap_pages = int(os.getenv("INCREMENTAL_OVERLAP_PAGES", "2"))
     resume_page = max(1, resume_page)
-    scan_start = max(1, resume_page - 2) if resume_page > 1 else 1
-    page_limit = min(total_pages, scan_start + MAX_INCREMENTAL_PAGES - 1)
+    scan_start = max(1, resume_page - overlap_pages)
+    page_limit = min(total_pages, resume_page + MAX_INCREMENTAL_PAGES - 1)
+
+    # If the stored cursor is already beyond today's final page, only recheck
+    # the tail overlap. This catches new rows added to the current last page.
+    if resume_page > total_pages:
+        scan_start = max(1, total_pages - overlap_pages + 1)
+        page_limit = total_pages
+
+    print(
+        f"Tail incremental scan: cursor={resume_page}, "
+        f"checking pages {scan_start}..{page_limit} of {total_pages}."
+    )
+
     for page in range(scan_start, page_limit + 1):
         print(f"Checking incremental page {page}/{total_pages}...")
         summaries = fetch_page_candidates(page)
-        pages_checked = page
+        pages_checked_count += 1
+        last_page_checked = page
 
         if summaries is None:
             failed_pages.append(page)
-            known_page_streak = 0
-            print("  -> Page failed or returned no usable list; not counted as a known page.")
+            print("  -> Page failed or returned no usable list; it will be retried.")
             continue
 
-        page_ids = []
+        page_ids: List[str] = []
         for summary in summaries:
             candidate_id = extract_candidate_id(summary)
             if candidate_id:
                 page_ids.append(candidate_id)
 
-        # Preserve order while removing duplicates.
         page_ids = list(dict.fromkeys(page_ids))
         new_ids = [candidate_id for candidate_id in page_ids if candidate_id not in run_seen_ids]
         print(f"  -> {len(new_ids)} new / {len(page_ids)} total IDs on page {page}.")
 
         if new_ids:
-            known_page_streak = 0
             details, successful_ids, failed_ids = fetch_new_candidate_details(new_ids)
             all_details.extend(details)
             successful_new_ids.update(successful_ids)
             failed_candidate_ids.extend(failed_ids)
-            # Avoid requesting a successful candidate twice in the same run.
             run_seen_ids.update(successful_ids)
-        elif page >= resume_page:
-            # Overlap pages before resume_page protect against pagination shifts,
-            # but must not prematurely stop a backlog continuation run.
-            known_page_streak += 1
-            print(f"  -> Fully known page streak: {known_page_streak}/{STOP_AFTER_KNOWN_PAGES}")
 
-        if known_page_streak >= STOP_AFTER_KNOWN_PAGES:
-            stop_reason = f"{STOP_AFTER_KNOWN_PAGES} consecutive fully-known pages"
-            break
+    # Never advance past a failed list page; retry it on the next run.
+    if failed_pages:
+        next_scan_page = min(failed_pages)
+        backlog_incomplete = True
+        stop_reason = f"retry failed page {next_scan_page}"
+    elif page_limit < total_pages:
+        next_scan_page = page_limit + 1
+        backlog_incomplete = True
+        stop_reason = f"batch page limit reached ({MAX_INCREMENTAL_PAGES})"
     else:
-        if page_limit < total_pages:
-            stop_reason = f"safety page limit reached ({MAX_INCREMENTAL_PAGES})"
-
-    backlog_incomplete = stop_reason.startswith("safety page limit")
-    next_scan_page = (pages_checked + 1) if backlog_incomplete else 1
+        # Cursor points immediately after the latest page. Future runs recheck
+        # the tail overlap and continue automatically when total_pages grows.
+        next_scan_page = total_pages + 1
+        backlog_incomplete = False
+        stop_reason = "caught up to current last page"
 
     summary = {
-        "mode": "incremental",
-        "pages_checked": pages_checked,
+        "mode": "tail_incremental",
+        "scan_start_page": scan_start,
+        "last_page_checked": last_page_checked,
+        "pages_checked_count": pages_checked_count,
         "new_candidates_found": len(successful_new_ids) + len(set(failed_candidate_ids)),
         "new_candidates_saved": len(successful_new_ids),
         "failed_pages": failed_pages,
         "failed_candidate_ids": sorted(set(failed_candidate_ids)),
-        "known_page_streak": known_page_streak,
         "stop_reason": stop_reason,
         "backlog_incomplete": backlog_incomplete,
         "next_scan_page": next_scan_page,
@@ -540,14 +554,12 @@ def main():
         })
         return
 
-    # Default and scheduled mode: smart incremental sync.
+    # Default and scheduled mode: tail/cursor incremental sync.
     seen_ids = ensure_seen_ids()
     previous_state = load_state()
-    resume_page = (
-        int(previous_state.get("next_scan_page", 1))
-        if previous_state.get("backlog_incomplete")
-        else 1
-    )
+    # The previous export stopped after page 5000. The state file supplied with
+    # this update starts at 5001; after that the cursor is maintained automatically.
+    resume_page = int(previous_state.get("next_scan_page", 5001))
     total_pages = get_total_pages()
     details, successful_new_ids, run_summary = collect_incremental_candidates(
         seen_ids=seen_ids,

@@ -53,8 +53,8 @@ jobs:
           START_PAGE: ${{ inputs.start_page }}
           END_PAGE: ${{ inputs.end_page }}
           MAX_WORKERS: "8"
-          STOP_AFTER_KNOWN_PAGES: "5"
           MAX_INCREMENTAL_PAGES: "100"
+          INCREMENTAL_OVERLAP_PAGES: "2"
         run: python applicantstack_scraper.py
 
       - name: List outputs
