@@ -1,8 +1,8 @@
 {
   "mode": "tail_incremental",
-  "scan_start_page": 6814,
+  "scan_start_page": 6815,
   "last_page_checked": 6816,
-  "pages_checked_count": 3,
+  "pages_checked_count": 2,
   "new_candidates_found": 5,
   "new_candidates_saved": 5,
   "failed_pages": [],
@@ -12,6 +12,6 @@
   "next_scan_page": 6817,
   "total_pages_at_run": 6816,
   "records_saved": 5,
-  "seen_ids_total": 202301,
-  "last_run_utc": "2026-07-14T07:56:46.397952Z"
+  "seen_ids_total": 202306,
+  "last_run_utc": "2026-07-14T10:42:36.337206Z"
 }
