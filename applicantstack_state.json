@@ -3,15 +3,15 @@
   "scan_start_page": 6815,
   "last_page_checked": 6816,
   "pages_checked_count": 2,
-  "new_candidates_found": 1,
-  "new_candidates_saved": 1,
+  "new_candidates_found": 8,
+  "new_candidates_saved": 8,
   "failed_pages": [],
   "failed_candidate_ids": [],
   "stop_reason": "caught up to current last page",
   "backlog_incomplete": false,
   "next_scan_page": 6817,
   "total_pages_at_run": 6816,
-  "records_saved": 1,
-  "seen_ids_total": 202349,
-  "last_run_utc": "2026-07-16T05:37:18.657771Z"
+  "records_saved": 8,
+  "seen_ids_total": 202357,
+  "last_run_utc": "2026-07-16T08:06:25.319795Z"
 }
