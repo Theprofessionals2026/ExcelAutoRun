@@ -1,17 +1,17 @@
 {
   "mode": "tail_incremental",
   "scan_start_page": 6815,
-  "last_page_checked": 6816,
-  "pages_checked_count": 2,
+  "last_page_checked": 6817,
+  "pages_checked_count": 3,
   "new_candidates_found": 4,
   "new_candidates_saved": 4,
   "failed_pages": [],
   "failed_candidate_ids": [],
   "stop_reason": "caught up to current last page",
   "backlog_incomplete": false,
-  "next_scan_page": 6817,
-  "total_pages_at_run": 6816,
+  "next_scan_page": 6818,
+  "total_pages_at_run": 6817,
   "records_saved": 4,
-  "seen_ids_total": 202399,
-  "last_run_utc": "2026-07-18T13:06:20.118744Z"
+  "seen_ids_total": 202403,
+  "last_run_utc": "2026-07-18T15:53:16.020041Z"
 }
