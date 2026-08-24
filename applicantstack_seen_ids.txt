@@ -6532,6 +6532,7 @@ a440faz1553w
 a440faz1556k
 a440faz1556w
 a440faz155bi
+a440faz155gd
 a440faz155kv
 a440faz155w4
 a440faz1562n
@@ -38064,6 +38065,7 @@ a440faz6s29f
 a440faz6s2ce
 a440faz6s2ij
 a440faz6s2qu
+a440faz6s3a1
 a440faz6s3ck
 a440faz6s3nr
 a440faz6s3ny
@@ -53189,6 +53191,7 @@ a440faz9g2vc
 a440faz9g2vr
 a440faz9g39y
 a440faz9g3pt
+a440faz9g42g
 a440faz9g42h
 a440faz9g4di
 a440faz9g4ec
